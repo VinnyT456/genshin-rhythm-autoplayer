@@ -1,0 +1,12 @@
+# Build output
+/main
+*.dSYM/
+*.o
+*.out
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/

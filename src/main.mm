@@ -7,6 +7,7 @@
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -39,10 +40,10 @@ static constexpr std::chrono::milliseconds kMinUpGapMs{30};
 // Consecutive "gone" samples before a key-up (flicker hysteresis).
 static constexpr int kReleaseFrames = 3;
 
-// 3x3 patch used only by the calibration snapshot.
-static constexpr int kRefRadius = 1;
-static constexpr int kRefPix    = (2 * kRefRadius + 1) * (2 * kRefRadius + 1);
-static constexpr int kRefLen    = kRefPix * 3;
+// A purple HOLD ends only after this many CONSECUTIVE white frames. Brief white
+// glints mid-bar (bright head/cap, gem highlight) are shorter than this, so the
+// hold survives them; only the real empty rail at the bar's end is sustained.
+static constexpr int kHoldWhiteFrames = 12;
 
 // ============================================================
 // Note color classification (BGRA buffer, read as RGB)
@@ -59,6 +60,19 @@ static inline bool isYellow(int r, int g, int b)
     return r > 200 && r > b + 60 && g > b;
 }
 
+// Empty rail is near-white/gray: all channels high and close together
+// (calibrated ~237,236,234 and ~255,255,251). Used to end a purple HOLD.
+static inline bool isWhite(int r, int g, int b)
+{
+    const int mn = std::min({r, g, b});
+    const int mx = std::max({r, g, b});
+    return mn > 200 && (mx - mn) < 25;
+}
+
+// Purple notes are HOLD bars (sustain the key); yellow are TAPS. White is the
+// empty rail (ends a purple hold). None = anything else (gap/shading/head).
+enum class NoteColor { None, Purple, Yellow, White };
+
 // ============================================================
 // Lane
 // ============================================================
@@ -71,12 +85,14 @@ struct Lane
 
     bool held = false;
     int  missCount = 0;
+    bool holdNote = false;   // current press came from a purple (hold) note
 
     SteadyClock::time_point burstGuardUntil{};
     SteadyClock::time_point pressedAt{};
     SteadyClock::time_point blockPressUntil{};
 };
 
+// Primary sample point (used for all press/tap detection).
 static std::array<Lane, 6> gLanes =
 {{
     { 358,  783, Key::A },   // lane 1
@@ -87,47 +103,39 @@ static std::array<Lane, 6> gLanes =
     { 1162, 783, Key::L }    // lane 6
 }};
 
-// Single-pixel color detection at the lane's sample point.
-static inline bool laneNotePresent(
+// While a purple HOLD is pressed, the note center whitens and the primary point
+// misreads as "white" (false bar-end). For hold continuation only, probe a
+// point offset above the center, which stays on the purple bar body.
+static constexpr int kHoldProbeDY = -12;
+
+// Single-pixel color detection at an arbitrary (x,y).
+static inline NoteColor colorAt(
     const uint8_t* base, size_t stride, size_t width, size_t height,
-    const Lane& lane)
+    int x, int y)
 {
-    const int x = lane.x, y = lane.y;
     if (x < 0 || y < 0 ||
         static_cast<size_t>(x) >= width ||
         static_cast<size_t>(y) >= height)
-        return false;
+        return NoteColor::None;
 
     const uint8_t* p = base + (size_t)y * stride + (size_t)x * 4;
     const int b = p[0], g = p[1], r = p[2];
-    return isPurple(r, g, b) || isYellow(r, g, b);
+    if (isPurple(r, g, b)) return NoteColor::Purple;
+    if (isYellow(r, g, b)) return NoteColor::Yellow;
+    if (isWhite(r, g, b))  return NoteColor::White;
+    return NoteColor::None;
+}
+
+static inline NoteColor laneNoteColor(
+    const uint8_t* base, size_t stride, size_t width, size_t height,
+    const Lane& lane)
+{
+    return colorAt(base, stride, width, height, lane.x, lane.y);
 }
 
 // ============================================================
 // Calibration helpers
 // ============================================================
-
-static inline bool sampleRefPatch(
-    const uint8_t* base, size_t stride, size_t width, size_t height,
-    int cx, int cy, uint8_t out[kRefLen])
-{
-    int i = 0;
-    for (int dy = -kRefRadius; dy <= kRefRadius; ++dy)
-    for (int dx = -kRefRadius; dx <= kRefRadius; ++dx)
-    {
-        const int x = cx + dx, y = cy + dy;
-        if (x < 0 || y < 0 ||
-            static_cast<size_t>(x) >= width ||
-            static_cast<size_t>(y) >= height)
-            return false;
-        const uint8_t* p =
-            base + (size_t)y * stride + (size_t)x * 4;
-        out[i++] = p[2];   // R
-        out[i++] = p[1];   // G
-        out[i++] = p[0];   // B
-    }
-    return true;
-}
 
 // Save a BGRA crop around (cx,cy) to PNG, marking the sample pixel red.
 static void saveCropPNG(
@@ -279,24 +287,23 @@ static std::atomic<bool> gCalibrateCapture{false}; // pending snapshot request?
         for (size_t li = 0; li < gLanes.size(); ++li)
         {
             Lane& lane = gLanes[li];
-            uint8_t patch[kRefLen];
-            bool ok = sampleRefPatch(base, stride, width, height,
-                                     lane.x, lane.y, patch);
             saveCropPNG(base, stride, width, height, lane.x, lane.y, 80,
                         "/tmp/calib_lane" + std::to_string(li + 1) + ".png");
 
             std::cout << "Lane " << (li + 1) << " (x=" << lane.x
                       << ", y=" << lane.y << "): ";
-            if (!ok) { std::cout << "OUT OF BOUNDS\n"; continue; }
+            if (lane.x < 0 || lane.y < 0 ||
+                (size_t)lane.x >= width || (size_t)lane.y >= height)
+            { std::cout << "OUT OF BOUNDS\n"; continue; }
 
-            long sr = 0, sg = 0, sb = 0;
-            for (int p = 0; p < kRefPix; ++p) {
-                sr += patch[p*3+0]; sg += patch[p*3+1]; sb += patch[p*3+2];
-            }
-            int ar = sr/kRefPix, ag = sg/kRefPix, ab = sb/kRefPix;
-            const char* cls = isPurple(ar,ag,ab) ? "PURPLE"
-                            : isYellow(ar,ag,ab) ? "YELLOW" : "none";
-            std::cout << "avg(" << ar << "," << ag << "," << ab << ") -> "
+            // Single center pixel — matches runtime detection and avoids
+            // averaging over a skinned note's facets/rings (which a patch does).
+            const uint8_t* p =
+                base + (size_t)lane.y * stride + (size_t)lane.x * 4;
+            int b = p[0], g = p[1], r = p[2];
+            const char* cls = isPurple(r,g,b) ? "PURPLE"
+                            : isYellow(r,g,b) ? "YELLOW" : "none";
+            std::cout << "rgb(" << r << "," << g << "," << b << ") -> "
                       << cls << "\n";
         }
         std::cout << "=============================================\n"
@@ -314,10 +321,13 @@ static std::atomic<bool> gCalibrateCapture{false}; // pending snapshot request?
 
     for (Lane& lane : gLanes)
     {
-        const bool detected =
-            laneNotePresent(base, stride, width, height, lane);
+        const NoteColor color =
+            laneNoteColor(base, stride, width, height, lane);
+        const bool isNote  = (color == NoteColor::Purple ||
+                              color == NoteColor::Yellow);
+        const bool isEmpty = (color == NoteColor::White);
 
-        if (detected && !lane.held)
+        if (isNote && !lane.held)
         {
             if (now < lane.blockPressUntil)   // enforce min up-gap
                 continue;
@@ -325,31 +335,60 @@ static std::atomic<bool> gCalibrateCapture{false}; // pending snapshot request?
             lane.held      = true;
             lane.missCount = 0;
             lane.pressedAt = now;
+            lane.holdNote  = (color == NoteColor::Purple);  // purple = sustain
             lane.burstGuardUntil = now + kClickBurstGuard;
             _keyboard.keyDown(lane.key);
         }
-        else if (detected && lane.held)
+        else if (lane.held && lane.holdNote)
         {
-            lane.missCount = 0;
-
-            if (now - lane.pressedAt >= kMaxHoldMs)   // split touching notes
+            // HOLD (purple): the note CENTER whitens while pressed, so the
+            // primary point misreads as white. Judge the bar from a probe point
+            // offset up the bar body instead. Release only on SUSTAINED white
+            // there (real empty rail), surviving brief glints.
+            const NoteColor probe = colorAt(base, stride, width, height,
+                                            lane.x, lane.y + kHoldProbeDY);
+            if (probe == NoteColor::White)
             {
-                lane.held = false;
+                if (now - lane.pressedAt < kMinHoldMs)
+                    continue;
+                if (++lane.missCount < kHoldWhiteFrames)
+                    continue;
+
+                lane.held      = false;
+                lane.missCount = 0;
                 lane.blockPressUntil = now + kMinUpGapMs;
                 _keyboard.keyUp(lane.key);
             }
+            else
+            {
+                lane.missCount = 0;   // any non-white resets the white streak
+            }
         }
-        else if (!detected && lane.held)
+        else if (lane.held)   // TAP (yellow)
         {
-            if (now - lane.pressedAt < kMinHoldMs)     // min down time
-                continue;
-            if (++lane.missCount < kReleaseFrames)     // release hysteresis
-                continue;
+            if (isNote)
+            {
+                lane.missCount = 0;
+                // Split two touching taps into separate presses.
+                if (now - lane.pressedAt >= kMaxHoldMs)
+                {
+                    lane.held = false;
+                    lane.blockPressUntil = now + kMinUpGapMs;
+                    _keyboard.keyUp(lane.key);
+                }
+            }
+            else   // not a note anymore
+            {
+                if (now - lane.pressedAt < kMinHoldMs)
+                    continue;
+                if (++lane.missCount < kReleaseFrames)
+                    continue;
 
-            lane.held      = false;
-            lane.missCount = 0;
-            lane.blockPressUntil = now + kMinUpGapMs;
-            _keyboard.keyUp(lane.key);
+                lane.held      = false;
+                lane.missCount = 0;
+                lane.blockPressUntil = now + kMinUpGapMs;
+                _keyboard.keyUp(lane.key);
+            }
         }
     }
 
@@ -376,6 +415,14 @@ static std::atomic<bool> gCalibrateCapture{false}; // pending snapshot request?
 // ============================================================
 // Main
 // ============================================================
+
+// Bring the Genshin window to the front (so keystrokes land + you can watch).
+static void activateGenshin(pid_t pid)
+{
+    NSRunningApplication* app =
+        [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    [app activateWithOptions:NSApplicationActivateAllWindows];
+}
 
 static pid_t findGenshinPID()
 {
@@ -507,19 +554,23 @@ int main(int argc, const char* argv[])
             << std::flush;
 
         // Terminal-driven control. AppKit calls hop to the main thread.
-        std::thread([controller]{
+        std::thread([controller, genshinPID]{
             std::string line;
             while (std::getline(std::cin, line))
             {
                 if (line == "q" || line == "Q") { gRunning.store(false); std::exit(0); }
                 else if (line == "s" || line == "S")
-                    dispatch_async(dispatch_get_main_queue(),
-                                   ^{ [controller startDetector]; });
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        activateGenshin(genshinPID);   // focus the game
+                        [controller startDetector];
+                    });
                 else if (line == "t" || line == "T")
                     dispatch_async(dispatch_get_main_queue(),
                                    ^{ [controller stopDetector]; });
                 else if (line == "c" || line == "C")
                 {
+                    dispatch_async(dispatch_get_main_queue(),
+                                   ^{ activateGenshin(genshinPID); });  // focus
                     for (int s = 3; s > 0; --s) {
                         std::cout << "Snapshot in " << s << "..." << std::endl;
                         std::this_thread::sleep_for(std::chrono::seconds(1));

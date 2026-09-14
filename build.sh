@@ -7,6 +7,7 @@ cd "$(dirname "$0")"
 clang++ -std=c++17 -ObjC++ -fobjc-arc -O2 \
   src/main.mm \
   src/keyboard.mm \
+  src/themes/theme.mm \
   -Isrc \
   -framework Cocoa \
   -framework ScreenCaptureKit \

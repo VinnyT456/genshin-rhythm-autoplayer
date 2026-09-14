@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "keyboard.h"
+#include "themes/theme.h"
 
 // ============================================================
 // Configuration
@@ -47,17 +48,24 @@ static constexpr int kHoldWhiteFrames = 12;
 
 // ============================================================
 // Note color classification (BGRA buffer, read as RGB)
-//   PURPLE ~ (181,165,244)  YELLOW ~ (243,209,130)  empty ~ near-white
+//
+// HOLD/TAP classification is theme-specific and lives in src/themes/. The active
+// theme is chosen at calibration (lane 2 = hold, lane 5 = tap) and used through
+// gActiveTheme->isHold / ->isTap below. Empty-rail (white) detection is generic.
 // ============================================================
 
-static inline bool isPurple(int r, int g, int b)
+// The theme whose classifiers are in use. Defaults to "default" and is replaced
+// by calibration / a persisted choice at startup.
+static const Theme* gActiveTheme = themes::by_name("default");
+
+static inline bool isHoldColor(int r, int g, int b)
 {
-    return b > 200 && b > r + 30 && r >= g;
+    return gActiveTheme && gActiveTheme->isHold(r, g, b);
 }
 
-static inline bool isYellow(int r, int g, int b)
+static inline bool isTapColor(int r, int g, int b)
 {
-    return r > 200 && r > b + 60 && g > b;
+    return gActiveTheme && gActiveTheme->isTap(r, g, b);
 }
 
 // Empty rail is near-white/gray: all channels high and close together
@@ -67,6 +75,21 @@ static inline bool isWhite(int r, int g, int b)
     const int mn = std::min({r, g, b});
     const int mx = std::max({r, g, b});
     return mn > 200 && (mx - mn) < 25;
+}
+
+// The MISS burst: a reddish flash the game shows at the hit line when a note is
+// MISSED. It is a UI effect, identical across every theme, so it is a global
+// reference (not part of a Theme). Seeing it means this lane just failed a note
+// and must be reset for a clean restart — this is how a lane recovers instead of
+// staying stuck. Matched within a small tolerance to absorb capture jitter.
+static constexpr int kMissBurst[3] = {243, 177, 168};
+static constexpr int kMissBurstTol = 5;
+
+static inline bool isMissBurst(int r, int g, int b)
+{
+    return std::abs(r - kMissBurst[0]) <= kMissBurstTol &&
+           std::abs(g - kMissBurst[1]) <= kMissBurstTol &&
+           std::abs(b - kMissBurst[2]) <= kMissBurstTol;
 }
 
 // Purple notes are HOLD bars (sustain the key); yellow are TAPS. White is the
@@ -95,12 +118,12 @@ struct Lane
 // Primary sample point (used for all press/tap detection).
 static std::array<Lane, 6> gLanes =
 {{
-    { 358,  783, Key::A },   // lane 1
-    { 519,  783, Key::S },   // lane 2 (purple, calibrated)
-    { 680,  783, Key::D },   // lane 3
-    { 840,  783, Key::J },   // lane 4
-    { 1001, 783, Key::K },   // lane 5 (gold, calibrated)
-    { 1162, 783, Key::L }    // lane 6
+    { 355,  785, Key::A },   // lane 1
+    { 515,  785, Key::S },   // lane 2 (purple, calibrated)
+    { 675,  785, Key::D },   // lane 3
+    { 835,  785, Key::J },   // lane 4
+    { 995, 785, Key::K },   // lane 5 (gold, calibrated)
+    { 1155, 785, Key::L }    // lane 6
 }};
 
 // While a purple HOLD is pressed, the note center whitens and the primary point
@@ -120,9 +143,9 @@ static inline NoteColor colorAt(
 
     const uint8_t* p = base + (size_t)y * stride + (size_t)x * 4;
     const int b = p[0], g = p[1], r = p[2];
-    if (isPurple(r, g, b)) return NoteColor::Purple;
-    if (isYellow(r, g, b)) return NoteColor::Yellow;
-    if (isWhite(r, g, b))  return NoteColor::White;
+    if (isHoldColor(r, g, b)) return NoteColor::Purple;
+    if (isTapColor(r, g, b))  return NoteColor::Yellow;
+    if (isWhite(r, g, b))     return NoteColor::White;
     return NoteColor::None;
 }
 
@@ -186,6 +209,45 @@ static void saveCropPNG(
     CGImageRelease(img);
     CGContextRelease(ctx);
     CGColorSpaceRelease(cs);
+}
+
+// ============================================================
+// Theme persistence
+// ============================================================
+
+// The chosen theme's name is stored next to the executable so it reloads across
+// runs without re-calibrating.
+static std::string themePath()
+{
+    NSString* exe = [[NSBundle mainBundle] executablePath];
+    NSString* dir = exe != nil ? [exe stringByDeletingLastPathComponent]
+                               : NSFileManager.defaultManager.currentDirectoryPath;
+    return [dir stringByAppendingPathComponent:@"theme.txt"].UTF8String;
+}
+
+static void saveTheme(const char* name)
+{
+    NSString* ns = [NSString stringWithUTF8String:name ? name : "default"];
+    NSString* path = [NSString stringWithUTF8String:themePath().c_str()];
+    if ([ns writeToFile:path atomically:YES
+               encoding:NSUTF8StringEncoding error:nil])
+        std::cout << "  theme saved -> " << ns.UTF8String << "\n";
+}
+
+static void loadTheme()
+{
+    NSString* path = [NSString stringWithUTF8String:themePath().c_str()];
+    NSString* name = [[NSString stringWithContentsOfFile:path
+                                                encoding:NSUTF8StringEncoding
+                                                   error:nil]
+        stringByTrimmingCharactersInSet:
+            NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (name.length == 0) return;   // none saved — keep the default
+    const Theme* t = themes::by_name(name.UTF8String);
+    if (t) {
+        gActiveTheme = t;
+        std::cout << "Loaded theme: " << t->name << "\n";
+    }
 }
 
 // ============================================================
@@ -284,6 +346,12 @@ static std::atomic<bool> gCalibrateCapture{false}; // pending snapshot request?
                     (int)width / 2, (int)height / 2,
                     (int)std::max(width, height), "/tmp/calib_full.png");
 
+        // The calibration screen is fixed: lane 2 is always a HOLD, lane 5 is
+        // always a TAP. Sample those two pixels and pick the theme whose hold/tap
+        // reference colours are nearest — no per-pixel classification guesswork.
+        RGB holdSample{}, tapSample{};
+        bool haveHold = false, haveTap = false;
+
         for (size_t li = 0; li < gLanes.size(); ++li)
         {
             Lane& lane = gLanes[li];
@@ -300,11 +368,27 @@ static std::atomic<bool> gCalibrateCapture{false}; // pending snapshot request?
             // averaging over a skinned note's facets/rings (which a patch does).
             const uint8_t* p =
                 base + (size_t)lane.y * stride + (size_t)lane.x * 4;
-            int b = p[0], g = p[1], r = p[2];
-            const char* cls = isPurple(r,g,b) ? "PURPLE"
-                            : isYellow(r,g,b) ? "YELLOW" : "none";
-            std::cout << "rgb(" << r << "," << g << "," << b << ") -> "
-                      << cls << "\n";
+            const int b = p[0], g = p[1], r = p[2];
+            std::cout << "rgb(" << r << "," << g << "," << b << ")";
+            if (li == 1) { holdSample = RGB{r,g,b}; haveHold = true; std::cout << "  <- HOLD ref (lane 2)"; }
+            if (li == 4) { tapSample  = RGB{r,g,b}; haveTap  = true; std::cout << "  <- TAP ref (lane 5)"; }
+            std::cout << "\n";
+        }
+
+        // Choose the theme from the two reference samples and persist it.
+        if (haveHold && haveTap)
+        {
+            const Theme* chosen = themes::nearest(holdSample, tapSample);
+            if (chosen)
+            {
+                gActiveTheme = chosen;
+                saveTheme(chosen->name);
+                std::cout << "Selected theme: " << chosen->name << "\n";
+            }
+        }
+        else
+        {
+            std::cout << "Calibration incomplete: lane 2 / lane 5 out of bounds.\n";
         }
         std::cout << "=============================================\n"
                   << std::flush;
@@ -326,6 +410,26 @@ static std::atomic<bool> gCalibrateCapture{false}; // pending snapshot request?
         const bool isNote  = (color == NoteColor::Purple ||
                               color == NoteColor::Yellow);
         const bool isEmpty = (color == NoteColor::White);
+
+        // MISS-burst recovery: if the hit line shows the reddish miss flash, this
+        // lane just failed a note. Force it fully back to idle so it can start
+        // clean on the next note — this is what breaks a stuck hold out of its
+        // stuck state instead of ignoring everything that follows.
+        if (lane.x >= 0 && lane.y >= 0 &&
+            (size_t)lane.x < width && (size_t)lane.y < height)
+        {
+            const uint8_t* hp = base + (size_t)lane.y * stride + (size_t)lane.x * 4;
+            if (isMissBurst(hp[2], hp[1], hp[0]))   // hp = BGRA
+            {
+                if (lane.held)
+                    _keyboard.keyUp(lane.key);
+                lane.held      = false;
+                lane.holdNote  = false;
+                lane.missCount = 0;
+                lane.blockPressUntil = now + kMinUpGapMs;
+                continue;   // don't run the state machine on a miss frame
+            }
+        }
 
         if (isNote && !lane.held)
         {
@@ -392,6 +496,30 @@ static std::atomic<bool> gCalibrateCapture{false}; // pending snapshot request?
         }
     }
 
+#if DEBUG_TRACE
+    // Held-state snapshot of all six lanes, printed only when it changes. Each
+    // slot: '.' idle, 'H' holding a HOLD note, 'T' holding a TAP. A lane stuck
+    // on shows here as a slot that never returns to '.'. Enable -DDEBUG_TRACE=1.
+    if (gRunning.load(std::memory_order_relaxed))
+    {
+        static bool sHeld[6] = {false,false,false,false,false,false};
+        bool changed = false;
+        for (size_t i = 0; i < gLanes.size(); ++i)
+            if (gLanes[i].held != sHeld[i]) { changed = true; break; }
+        if (changed)
+        {
+            std::cerr << "HELD ";
+            for (size_t i = 0; i < gLanes.size(); ++i)
+            {
+                const Lane& l = gLanes[i];
+                std::cerr << (l.held ? (l.holdNote ? 'H' : 'T') : '.');
+                sHeld[i] = l.held;
+            }
+            std::cerr << "\n";
+        }
+    }
+#endif
+
     CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 }
 
@@ -449,6 +577,9 @@ int main(int argc, const char* argv[])
         NSDictionary* options =
             @{ (__bridge id)kAXTrustedCheckOptionPrompt: @YES };
         AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+
+        // Restore the saved theme choice (falls back to "default").
+        loadTheme();
 
         // Resolve the display to capture.
         __block SCShareableContent* shareableContent = nil;

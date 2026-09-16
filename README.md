@@ -79,6 +79,13 @@ Timing and color thresholds are compile-time constants at the top of
 [`src/main.mm`](src/main.mm) if you need to tune them for a different resolution,
 skin, or song.
 
+## Troubleshooting
+
+**Hold notes start breaking mid-bar** — quit Genshin, wait a few seconds, then
+reopen it. A held key can occasionally get stuck down inside the game; restarting
+Genshin clears it. (Restarting the autoplayer alone does not fix this — the stuck
+state lives in the game process.)
+
 ## Project layout
 
 ```

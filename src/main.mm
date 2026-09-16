@@ -675,6 +675,8 @@ int main(int argc, const char* argv[])
             << "  s : start autoplay\n"
             << "  t : stop autoplay\n"
             << "  q : quit\n\n"
+            << "TIP: if hold notes start breaking mid-bar, quit Genshin, wait a\n"
+            << "     few seconds, then reopen it (clears a stuck key).\n\n"
             << "FPS: " << kTargetFPS << "\n\n"
             << std::flush;
 

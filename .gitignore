@@ -10,3 +10,11 @@
 # Editor
 .vscode/
 .idea/
+
+# Runtime / debug output
+theme.txt
+trace.log
+*.playmap
+
+# Local backups
+main_copy.mm

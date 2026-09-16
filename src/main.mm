@@ -41,10 +41,11 @@ static constexpr std::chrono::milliseconds kMinUpGapMs{30};
 // Consecutive "gone" samples before a key-up (flicker hysteresis).
 static constexpr int kReleaseFrames = 3;
 
-// A purple HOLD ends only after this many CONSECUTIVE white frames. Brief white
-// glints mid-bar (bright head/cap, gem highlight) are shorter than this, so the
-// hold survives them; only the real empty rail at the bar's end is sustained.
-static constexpr int kHoldWhiteFrames = 12;
+// A purple HOLD ends only after this many CONSECUTIVE white frames. A pressed
+// hold flickers between purple and full white (the whole bar can read 255,255,
+// 255 for up to ~120ms mid-hold), so this must outlast that transient — only the
+// real empty rail at the bar's end is white for longer.
+static constexpr int kHoldWhiteFrames = 30;
 
 // Absolute safety cap on a HOLD. If the bar-end white is never seen (song end,
 // menu, or a transition covers the lane while a hold is down), the key would
@@ -130,11 +131,6 @@ static std::array<Lane, 6> gLanes =
     { 995, 785, Key::K },   // lane 5 (gold, calibrated)
     { 1155, 785, Key::L }    // lane 6
 }};
-
-// While a purple HOLD is pressed, the note center whitens and the primary point
-// misreads as "white" (false bar-end). For hold continuation only, probe a
-// point offset above the center, which stays on the purple bar body.
-static constexpr int kHoldProbeDY = -12;
 
 // Single-pixel color detection at an arbitrary (x,y).
 static inline NoteColor colorAt(
@@ -463,12 +459,12 @@ static std::atomic<bool> gCalibrateCapture{false}; // pending snapshot request?
                 continue;
             }
 
-            // HOLD (purple): the note CENTER whitens while pressed, so the
-            // primary point misreads as white. Judge the bar from a probe point
-            // offset up the bar body instead. Release only on SUSTAINED white
-            // there (real empty rail), surviving brief glints.
-            const NoteColor probe = colorAt(base, stride, width, height,
-                                            lane.x, lane.y + kHoldProbeDY);
+            // HOLD (purple): a pressed hold flickers purple<->full white, so the
+            // center alone can't judge the bar. But the flicker-white is brief;
+            // the real bar-end white is sustained. Count consecutive white frames
+            // at the primary point and only release after kHoldWhiteFrames of them
+            // (single point = no false-positive surface that would stick lanes).
+            const NoteColor probe = laneNoteColor(base, stride, width, height, lane);
             if (probe == NoteColor::White)
             {
                 if (now - lane.pressedAt < kMinHoldMs)
@@ -675,8 +671,6 @@ int main(int argc, const char* argv[])
             << "  s : start autoplay\n"
             << "  t : stop autoplay\n"
             << "  q : quit\n\n"
-            << "TIP: if hold notes start breaking mid-bar, quit Genshin, wait a\n"
-            << "     few seconds, then reopen it (clears a stuck key).\n\n"
             << "FPS: " << kTargetFPS << "\n\n"
             << std::flush;
 

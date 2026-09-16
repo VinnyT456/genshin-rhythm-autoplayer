@@ -46,6 +46,11 @@ static constexpr int kReleaseFrames = 3;
 // hold survives them; only the real empty rail at the bar's end is sustained.
 static constexpr int kHoldWhiteFrames = 12;
 
+// Absolute safety cap on a HOLD. If the bar-end white is never seen (song end,
+// menu, or a transition covers the lane while a hold is down), the key would
+// otherwise stay stuck DOWN. No real hold lasts this long, so force a release.
+static constexpr std::chrono::milliseconds kHoldMaxMs{10000};
+
 // ============================================================
 // Note color classification (BGRA buffer, read as RGB)
 //
@@ -445,6 +450,19 @@ static std::atomic<bool> gCalibrateCapture{false}; // pending snapshot request?
         }
         else if (lane.held && lane.holdNote)
         {
+            // Safety cap: never let a hold stay down past kHoldMaxMs (song end,
+            // menu, or a transition over the lane), which would otherwise leave
+            // the key stuck DOWN and break every subsequent note.
+            if (now - lane.pressedAt >= kHoldMaxMs)
+            {
+                lane.held      = false;
+                lane.holdNote  = false;
+                lane.missCount = 0;
+                lane.blockPressUntil = now + kMinUpGapMs;
+                _keyboard.keyUp(lane.key);
+                continue;
+            }
+
             // HOLD (purple): the note CENTER whitens while pressed, so the
             // primary point misreads as white. Judge the bar from a probe point
             // offset up the bar body instead. Release only on SUSTAINED white
@@ -495,30 +513,6 @@ static std::atomic<bool> gCalibrateCapture{false}; // pending snapshot request?
             }
         }
     }
-
-#if DEBUG_TRACE
-    // Held-state snapshot of all six lanes, printed only when it changes. Each
-    // slot: '.' idle, 'H' holding a HOLD note, 'T' holding a TAP. A lane stuck
-    // on shows here as a slot that never returns to '.'. Enable -DDEBUG_TRACE=1.
-    if (gRunning.load(std::memory_order_relaxed))
-    {
-        static bool sHeld[6] = {false,false,false,false,false,false};
-        bool changed = false;
-        for (size_t i = 0; i < gLanes.size(); ++i)
-            if (gLanes[i].held != sHeld[i]) { changed = true; break; }
-        if (changed)
-        {
-            std::cerr << "HELD ";
-            for (size_t i = 0; i < gLanes.size(); ++i)
-            {
-                const Lane& l = gLanes[i];
-                std::cerr << (l.held ? (l.holdNote ? 'H' : 'T') : '.');
-                sHeld[i] = l.held;
-            }
-            std::cerr << "\n";
-        }
-    }
-#endif
 
     CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 }

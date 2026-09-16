@@ -15,10 +15,12 @@ inline bool isHold(int r, int g, int b)
     return b > 200 && b > r + 30 && r >= g;
 }
 
-// TAP: gold/yellow. Red dominant, well above blue, green above blue.
+// TAP: gold/yellow. Red dominant, well above blue, green above blue. The blue
+// ceiling rejects the pale hit/press flash (~254,250,188) that briefly appears
+// as a note is struck — real gold notes have low blue (~87-130), the flash ~188.
 inline bool isTap(int r, int g, int b)
 {
-    return r > 200 && r > b + 60 && g > b;
+    return r > 200 && r > b + 60 && g > b && b < 160;
 }
 
 // Fingerprints sampled on the calibration screen: lane 2 (hold), lane 5 (tap).

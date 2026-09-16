@@ -96,6 +96,12 @@ void Keyboard::post(
         return;
 
 
+    // Zero the event's modifier/state flags so each key event is fully self
+    // contained and can't carry global key state onto the target — one lane's
+    // key never influences another's.
+    CGEventSetFlags(event, (CGEventFlags)0);
+
+
     // Post directly to the target application's event queue instead of
     // relying on whichever application happens to be frontmost.
     if (targetPID > 0)
